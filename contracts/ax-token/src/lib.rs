@@ -4,7 +4,7 @@ mod flash_loan_protection;
 use flash_loan_protection::FlashLoanGuard;
 
 use arenax_events::ax_token as events;
-use soroban_sdk::{contract, contractimpl, contracttype, Address, Env, String, Symbol, Vec};
+use soroban_sdk::{contract, contractimpl, contracttype, Address, Env, Map, String, Symbol, Vec};
 
 #[contracttype]
 #[derive(Clone, Debug)]
@@ -90,6 +90,16 @@ pub enum DataKey {
     // Flash loan protection
     LastOpSequence(Address),
     GlobalLastSequence,
+    // Emergency pause
+    PauseInfo,
+    Paused,
+    PauseTimeout,
+    // Supply cap enforcement
+    SupplyCap,
+    // Vote delegation
+    Delegate(Address),
+    Delegators(Address),
+    DelegationHistory(Address),
 }
 
 #[contract]
@@ -145,6 +155,80 @@ impl AxToken {
             .set(&DataKey::TotalSupply, &new_supply);
 
         events::emit_mint(env, &to, amount);
+    }
+
+    /// Mint to many recipients in a single transaction.
+    ///
+    /// `recipients[i]` receives `amounts[i]`. All checks (length match,
+    /// positive amounts, supply cap) are evaluated before any storage is
+    /// written; if any of them fail, or an amount/total overflows, the
+    /// whole call panics and — as with any Soroban contract invocation —
+    /// every storage write already made in this call is rolled back, so
+    /// the batch is atomic: either every recipient gets minted or none do.
+    ///
+    /// Gas: repeated recipients in the input are merged in memory first, so
+    /// each unique address gets exactly one balance read and one write no
+    /// matter how many times it appears in the batch, and `TotalSupply` is
+    /// written once for the whole batch rather than once per entry. One
+    /// mint event is still emitted per input entry, matching what calling
+    /// `mint` that many times would have emitted.
+    pub fn batch_mint(env: &Env, recipients: Vec<Address>, amounts: Vec<i128>) {
+        Self::require_admin(env);
+
+        if recipients.len() != amounts.len() {
+            panic!("recipients and amounts length mismatch");
+        }
+        if recipients.is_empty() {
+            panic!("batch must not be empty");
+        }
+
+        let mut per_recipient_delta: Map<Address, i128> = Map::new(env);
+        let mut total: i128 = 0;
+
+        for i in 0..recipients.len() {
+            let to = recipients.get(i).unwrap();
+            let amount = amounts.get(i).unwrap();
+
+            if amount <= 0 {
+                panic!("amount must be positive");
+            }
+
+            total = total.checked_add(amount).expect("batch total overflow");
+
+            let existing = per_recipient_delta.get(to.clone()).unwrap_or(0);
+            per_recipient_delta.set(
+                to,
+                existing.checked_add(amount).expect("batch total overflow"),
+            );
+        }
+
+        let current_supply = Self::total_supply(env);
+        let new_supply = current_supply.checked_add(total).expect("supply overflow");
+
+        let cap = Self::get_supply_cap(env.clone());
+        if cap > 0 && new_supply > cap {
+            panic!("supply cap exceeded");
+        }
+
+        for (to, delta) in per_recipient_delta.iter() {
+            let current_balance = Self::balance(env, to.clone());
+            let new_balance = current_balance
+                .checked_add(delta)
+                .expect("balance overflow");
+            env.storage()
+                .instance()
+                .set(&DataKey::Balance(to), &new_balance);
+        }
+
+        env.storage()
+            .instance()
+            .set(&DataKey::TotalSupply, &new_supply);
+
+        for i in 0..recipients.len() {
+            let to = recipients.get(i).unwrap();
+            let amount = amounts.get(i).unwrap();
+            events::emit_mint(env, &to, amount);
+        }
     }
 
     pub fn burn(env: &Env, from: Address, amount: i128) {

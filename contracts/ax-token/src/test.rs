@@ -712,3 +712,142 @@ fn test_adjust_cap_via_governance() {
     client.mint(&user1, &2000i128);
     assert_eq!(client.total_supply(), 3000);
 }
+
+// ============================================================================
+// BATCH MINT (#915)
+// ============================================================================
+
+#[test]
+fn test_batch_mint() {
+    let (env, admin, user1, user2) = create_test_env();
+    let contract_id = initialize_contract(&env, &admin);
+    let client = AxTokenClient::new(&env, &contract_id);
+    let user3 = Address::generate(&env);
+
+    env.mock_all_auths();
+
+    let recipients = soroban_sdk::vec![&env, user1.clone(), user2.clone(), user3.clone()];
+    let amounts = soroban_sdk::vec![&env, 1000i128, 2000i128, 500i128];
+    client.batch_mint(&recipients, &amounts);
+
+    assert_eq!(client.balance(&user1), 1000);
+    assert_eq!(client.balance(&user2), 2000);
+    assert_eq!(client.balance(&user3), 500);
+    assert_eq!(client.total_supply(), 3500);
+    assert_supply_equals_balances(&env, &contract_id, &[user1, user2, user3]);
+}
+
+#[test]
+#[should_panic(expected = "recipients and amounts length mismatch")]
+fn test_batch_mint_length_mismatch() {
+    let (env, admin, user1, _) = create_test_env();
+    let contract_id = initialize_contract(&env, &admin);
+    let client = AxTokenClient::new(&env, &contract_id);
+
+    env.mock_all_auths();
+
+    let recipients = soroban_sdk::vec![&env, user1.clone()];
+    let amounts = soroban_sdk::vec![&env, 1000i128, 2000i128];
+    client.batch_mint(&recipients, &amounts);
+}
+
+#[test]
+#[should_panic(expected = "batch must not be empty")]
+fn test_batch_mint_empty() {
+    let (env, admin, _, _) = create_test_env();
+    let contract_id = initialize_contract(&env, &admin);
+    let client = AxTokenClient::new(&env, &contract_id);
+
+    env.mock_all_auths();
+
+    let recipients: Vec<Address> = soroban_sdk::vec![&env];
+    let amounts: Vec<i128> = soroban_sdk::vec![&env];
+    client.batch_mint(&recipients, &amounts);
+}
+
+#[test]
+#[should_panic(expected = "amount must be positive")]
+fn test_batch_mint_rejects_non_positive_amount() {
+    let (env, admin, user1, user2) = create_test_env();
+    let contract_id = initialize_contract(&env, &admin);
+    let client = AxTokenClient::new(&env, &contract_id);
+
+    env.mock_all_auths();
+
+    let recipients = soroban_sdk::vec![&env, user1.clone(), user2.clone()];
+    let amounts = soroban_sdk::vec![&env, 1000i128, 0i128];
+    client.batch_mint(&recipients, &amounts);
+}
+
+#[test]
+#[should_panic]
+fn test_batch_mint_unauthorized() {
+    let (env, admin, user1, user2) = create_test_env();
+    let contract_id = initialize_contract(&env, &admin);
+    let client = AxTokenClient::new(&env, &contract_id);
+
+    // No mock_all_auths(): admin never authorized this call.
+    let recipients = soroban_sdk::vec![&env, user1.clone(), user2.clone()];
+    let amounts = soroban_sdk::vec![&env, 1000i128, 2000i128];
+    client.batch_mint(&recipients, &amounts);
+}
+
+#[test]
+fn test_batch_mint_merges_duplicate_recipients() {
+    // The same address appearing more than once in the batch should have
+    // its amounts summed into a single balance update, and still receive
+    // one mint event per input entry.
+    let (env, admin, user1, user2) = create_test_env();
+    let contract_id = initialize_contract(&env, &admin);
+    let client = AxTokenClient::new(&env, &contract_id);
+
+    env.mock_all_auths();
+
+    let recipients = soroban_sdk::vec![&env, user1.clone(), user1.clone(), user2.clone()];
+    let amounts = soroban_sdk::vec![&env, 300i128, 700i128, 500i128];
+    client.batch_mint(&recipients, &amounts);
+
+    assert_eq!(client.balance(&user1), 1000);
+    assert_eq!(client.balance(&user2), 500);
+    assert_eq!(client.total_supply(), 1500);
+}
+
+#[test]
+#[should_panic(expected = "supply cap exceeded")]
+fn test_batch_mint_atomic_on_cap_exceeded() {
+    // The batch must be all-or-nothing: if the combined total breaches the
+    // supply cap, NO recipient should end up minted, including the ones
+    // earlier in the list that would have fit under the cap on their own.
+    let (env, admin, user1, user2) = create_test_env();
+    let contract_id = initialize_contract(&env, &admin);
+    let client = AxTokenClient::new(&env, &contract_id);
+
+    env.mock_all_auths();
+    client.set_supply_cap(&1000i128);
+
+    let recipients = soroban_sdk::vec![&env, user1.clone(), user2.clone()];
+    let amounts = soroban_sdk::vec![&env, 900i128, 200i128]; // totals 1100 > cap
+    client.batch_mint(&recipients, &amounts);
+}
+
+#[test]
+fn test_batch_mint_atomic_rollback_leaves_no_partial_state() {
+    // Confirms the rollback from the panic above really is total: after a
+    // failed batch, neither recipient has any balance and total supply is
+    // unchanged.
+    let (env, admin, user1, user2) = create_test_env();
+    let contract_id = initialize_contract(&env, &admin);
+    let client = AxTokenClient::new(&env, &contract_id);
+
+    env.mock_all_auths();
+    client.set_supply_cap(&1000i128);
+
+    let recipients = soroban_sdk::vec![&env, user1.clone(), user2.clone()];
+    let amounts = soroban_sdk::vec![&env, 900i128, 200i128];
+    let result = client.try_batch_mint(&recipients, &amounts);
+
+    assert!(result.is_err());
+    assert_eq!(client.balance(&user1), 0);
+    assert_eq!(client.balance(&user2), 0);
+    assert_eq!(client.total_supply(), 0);
+}
